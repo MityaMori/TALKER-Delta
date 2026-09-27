@@ -13,6 +13,8 @@ Grounding the AI in the game engine. A fork of Coelacanthiform's TALKER-Expanded
 * Characters can now see their health and the health of others (optionally, they can see limb injuries on the player)
 * Dynamic news events (PDA broadcasts) are now visible to the AI. AI can see general broadcasts (usually blowout-related broadcasts) as well as broadcasts from their own faction
 * Option to disable some events for companions only
+* #NEW# Unique Characters speak when giving out tasks and have a memory of it
+* #NEW# Companions are aware of what your current objective is and could bring it up during idle chatter, level change or when directly asked about it
 
 
 
