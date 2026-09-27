@@ -1,0 +1,722 @@
+--------------------------------------------------------------------------------
+-- TALKER Trigger Task Extension
+-- Optional add-on. Does not replace the original task trigger script.
+--
+-- What it adds:
+--   * Tracks your current objective (title, giver, details)
+--   * Named / unique NPCs can comment when you accept a quest (after the talk window closes)
+--   * Companions can refer to the active objective in conversation
+--   * Objective is remembered across save / load
+--   * Ordinary random NPCs stay quiet on accept so the world doesn't get noisy
+--
+-- Note: unique characters (traders, story figures, etc.) may still speak on
+-- side jobs — there is no reliable way to tell yellow main-quest titles from
+-- white side-quest ones in the engine.
+--
+-- MCM (same option as the original task trigger):
+--   Talker → enable_trigger_task
+--     On     = unique NPCs may speak when you accept a quest
+--     Off    = no accept reaction (objective tracking still works)
+--     Silent = accept is logged quietly, no spoken line
+--   Also uses task_cooldown and anti_spam_cd from the same menu.
+--
+-- Install: place with the other talker_trigger_*.script files.
+-- Latest Talker Delta required.
+--------------------------------------------------------------------------------
+
+rawset(_G, "talker_current_objective", rawget(_G, "talker_current_objective") or {
+    title = nil,
+    description = nil,
+    giver = nil,
+    task_id = nil
+})
+
+package.path = package.path .. ";./bin/lua/?.lua;"
+local log = require("framework.logger")
+local queries = talker_game_queries
+local trigger = require("interface.trigger")
+local game_adapter = require("infra.game_adapter")
+local mcm = talker_mcm
+
+local script_name = "TALKER Trigger Task Extension"
+local chained_task_callback = nil
+
+local pending_task_accept = nil
+local PENDING_ACCEPT_TIMEOUT_MS = 120000
+
+talker_current_objective = talker_current_objective or {
+    title = nil,
+    description = nil,
+    giver = nil,
+    task_id = nil
+}
+
+local LAST_TASK_TIME = 0
+local LAST_TASK_SPAM = 0
+local TASK_COOLDOWN_CD = (mcm.get("task_cooldown") or 40) * 1000
+local ANTI_SPAM_CD = (mcm.get("anti_spam_cd") or 5) * 1000
+local mode_task = tonumber(mcm.get("enable_trigger_task") or "0")
+
+-- Optional known stage transitions when engine keeps stale titles
+local known_transitions = {
+    ["kuznecov_find_document_1"] = {
+        item = "main_story_1_quest_case",
+        next_title = "Return to Colonel Kuznetsov."
+    },
+}
+
+--------------------------------------------------------------------------------
+-- Silence / cooldown (accept path only; stock handles completion dialogue)
+--------------------------------------------------------------------------------
+
+local function get_silence_status(mode)
+    local current_time = queries.get_game_time_ms()
+
+    if (current_time - LAST_TASK_SPAM) < ANTI_SPAM_CD then
+        log.info("%s: Task event aborted (anti-spam)", script_name)
+        return nil
+    end
+    LAST_TASK_SPAM = current_time
+
+    local dialogue_ready = (current_time - LAST_TASK_TIME) >= TASK_COOLDOWN_CD
+
+    if mode == 0 then
+        if dialogue_ready then
+            LAST_TASK_TIME = current_time
+            return false
+        end
+        return true
+    elseif mode == 2 then
+        return true
+    end
+    return nil
+end
+
+--------------------------------------------------------------------------------
+-- Title / description helpers
+--------------------------------------------------------------------------------
+
+local function get_clean_task_title(tsk)
+    if not tsk then return nil end
+
+    local task_id = tsk:get_id()
+    local title = tsk:get_title()
+
+    if title and title ~= ""
+       and not string.find(title, "{=", 1, true)
+       and not string.find(title, "_", 1, true)
+       and (string.find(title, " ") or string.len(title) > 25) then
+        return title
+    end
+
+    if title and title ~= "" then
+        local translated = game.translate_string(title)
+        if translated and translated ~= title
+           and not string.find(translated, "{=", 1, true)
+           and (string.find(translated, " ") or not string.find(translated, "_", 1, true)) then
+            return translated
+        end
+    end
+
+    if task_id then
+        local possible_keys = {
+            task_id,
+            task_id .. "_title",
+            task_id .. "_name",
+            "st_" .. task_id,
+            "st_" .. task_id .. "_title",
+            "st_" .. task_id .. "_name",
+        }
+        if title and string.find(title, "_", 1, true) then
+            table.insert(possible_keys, 1, title)
+        end
+        for _, key in ipairs(possible_keys) do
+            local translated = game.translate_string(key)
+            if translated and translated ~= key
+               and not string.find(translated, "{=", 1, true)
+               and (string.find(translated, " ") or not string.find(translated, "_", 1, true)) then
+                return translated
+            end
+        end
+    end
+
+    return title or task_id
+end
+
+local function try_translate_descr(raw)
+    if not raw or raw == "" then
+        return nil
+    end
+    local text = raw
+    -- Always try translation (PDA text is often a string-table key)
+    local translated = game.translate_string(raw)
+    if translated and translated ~= "" and translated ~= raw then
+        text = translated
+    end
+    -- Reject condition junk / pure technical keys
+    if string.find(text, "{=", 1, true)
+       or string.find(text, "actor_has_item", 1, true)
+       or (string.find(text, "_", 1, true) and not string.find(text, " ", 1, true)) then
+        return nil
+    end
+    if string.len(text) > 220 then
+        text = string.sub(text, 1, 217) .. "..."
+    end
+    return text
+end
+
+local function get_clean_task_description(tsk)
+    if not tsk then return nil end
+
+    local task_id = tsk:get_id()
+    local candidates = {}
+
+    -- 1. Live methods on the task object (names vary by engine build)
+    local method_names = {
+        "get_description", "get_descr", "get_objective", "get_objectives",
+        "description", "descr"
+    }
+    for _, name in ipairs(method_names) do
+        local fn = tsk[name]
+        if type(fn) == "function" then
+            local ok, val = pcall(fn, tsk)
+            if ok and val and tostring(val) ~= "" then
+                candidates[#candidates + 1] = tostring(val)
+            end
+        elseif type(fn) == "string" and fn ~= "" then
+            candidates[#candidates + 1] = fn
+        end
+    end
+
+    -- 2. task_ini fields (storyline tasks often use different keys)
+    if task_manager and task_manager.task_ini and task_manager.task_ini.r_string_ex and task_id then
+        local keys = {
+            "descr", "description", "desc", "text", "objective",
+            "job_descr", "storyline_info", "info", "details"
+        }
+        for _, k in ipairs(keys) do
+            local v = task_manager.task_ini:r_string_ex(task_id, k)
+            if v and v ~= "" then
+                candidates[#candidates + 1] = v
+            end
+        end
+    end
+
+    -- 3. Common string-table key patterns (same idea as title lookup)
+    if task_id then
+        local key_patterns = {
+            task_id,
+            task_id .. "_descr",
+            task_id .. "_description",
+            task_id .. "_desc",
+            task_id .. "_text",
+            task_id .. "_objective",
+            "st_" .. task_id,
+            "st_" .. task_id .. "_descr",
+            "st_" .. task_id .. "_description",
+            "st_" .. task_id .. "_desc",
+            "st_" .. task_id .. "_objective",
+        }
+        for _, key in ipairs(key_patterns) do
+            candidates[#candidates + 1] = key
+        end
+    end
+
+    -- Pick first candidate that translates into readable PDA-style text
+    for _, raw in ipairs(candidates) do
+        local text = try_translate_descr(raw)
+        if text and text ~= "" then
+            log.info("%s: Task description found for %s", script_name, tostring(task_id))
+            return text
+        end
+    end
+
+    log.info("%s: Task description missing for %s", script_name, tostring(task_id))
+    return nil
+end
+
+--------------------------------------------------------------------------------
+-- Quest giver name
+--------------------------------------------------------------------------------
+
+local function get_quest_giver_name(task_info)
+    if task_info and task_info.task_giver_id then
+        local giver_id = task_info.task_giver_id
+        local client_obj = level.object_by_id(giver_id)
+        if client_obj then
+            if client_obj.character_name then
+                return client_obj:character_name()
+            elseif client_obj.name then
+                return client_obj:name()
+            end
+        end
+        local server_entity = alife_object(giver_id)
+        if server_entity then
+            if type(server_entity.character_name) == "function" then
+                return server_entity:character_name()
+            elseif type(server_entity.name) == "function" then
+                return server_entity:name()
+            end
+        end
+    end
+
+    local target = level.get_target_obj and level.get_target_obj()
+    if target then
+        if target.character_name then
+            return target:character_name()
+        elseif target.name then
+            return target:name()
+        end
+    end
+    return "Unknown"
+end
+
+--------------------------------------------------------------------------------
+-- Unique character check
+--------------------------------------------------------------------------------
+
+local function resolve_giver_id(task_info)
+    local giver_id = task_info and task_info.task_giver_id
+    if giver_id then
+        return giver_id
+    end
+    if level.get_target_obj then
+        local target = level.get_target_obj()
+        if target and target.id then
+            return target:id()
+        end
+    end
+    return nil
+end
+
+local function is_unique_giver(giver_id)
+    if not giver_id then
+        return false
+    end
+
+    if queries.is_unique_character_by_id and queries.is_unique_character_by_id(giver_id) == true then
+        return true
+    end
+
+    local tech = nil
+    local se = alife_object(giver_id)
+    if se and se.section_name then
+        tech = se:section_name()
+    end
+    if not tech then
+        local obj = level.object_by_id(giver_id)
+        if obj and obj.section_name then
+            tech = obj:section_name()
+        end
+    end
+    if not tech then
+        return false
+    end
+
+    local ok, unique_list = pcall(require, "infra.STALKER.unique_characters")
+    if ok and unique_list and unique_list[tech] ~= nil then
+        return true
+    end
+    return false
+end
+
+--------------------------------------------------------------------------------
+-- Pending accept (fire after dialog closes)
+--------------------------------------------------------------------------------
+
+local function clear_pending_task_accept(reason)
+    if pending_task_accept then
+        log.info("%s: Cleared pending task accept (%s)", script_name, reason or "unknown")
+        pending_task_accept = nil
+    end
+end
+
+local function try_fire_pending_task_accept()
+    if not pending_task_accept then
+        return
+    end
+
+    local p = pending_task_accept
+    pending_task_accept = nil
+
+    trigger.talker_game_event(p.description, p.player_vals, p.witnesses, true, {
+        is_task   = true,
+        is_silent = p.is_silent
+    })
+
+    if p.is_silent then
+        log.info("%s: Task accept event fired (silent) -> %s", script_name, p.task_title)
+    else
+        log.info("%s: Task accept event fired (spoken) -> %s", script_name, p.task_title)
+    end
+end
+
+local function start_pending_accept_watcher()
+    if not game_async or not game_async.repeat_until_true then
+        try_fire_pending_task_accept()
+        return
+    end
+
+    local checks = 0
+    local max_checks = 80
+    local min_checks_before_fire = 4
+    local saw_talking = false
+
+    game_async.repeat_until_true(0.5, function()
+        if not pending_task_accept then
+            return true
+        end
+
+        checks = checks + 1
+
+        local still_talking = false
+        if db and db.actor then
+            if db.actor.is_talking and db.actor:is_talking() then
+                still_talking = true
+            elseif db.actor.has_info and db.actor:has_info("dialog_wnd_open") then
+                still_talking = true
+            end
+        end
+
+        if still_talking then
+            saw_talking = true
+            return false
+        end
+
+        if checks >= min_checks_before_fire and (saw_talking or checks >= 6) then
+            log.info("%s: Dialog closed (or never detected) - firing pending accept", script_name)
+            try_fire_pending_task_accept()
+            return true
+        end
+
+        if checks >= max_checks then
+            clear_pending_task_accept("watcher timeout")
+            return true
+        end
+        return false
+    end)
+end
+
+function on_actor_menu_mode_changed(mode, last_mode)
+    if not pending_task_accept then
+        return
+    end
+    if mode == 11 or mode == "11"
+       or ((mode == 0 or mode == "0")
+           and (last_mode == 10 or last_mode == "10"
+                or last_mode == 11 or last_mode == "11")) then
+        try_fire_pending_task_accept()
+    end
+end
+
+function on_actor_menu_mode_changed_safe(mode, last_mode)
+    local ok, err = pcall(on_actor_menu_mode_changed, mode, last_mode)
+    if not ok then
+        log.error("%s: error in on_actor_menu_mode_changed: %s", script_name, tostring(err))
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Objective storage + optional stage refresh
+--------------------------------------------------------------------------------
+
+local function set_current_objective(title, giver, task_id, description)
+    local new_objective = {
+        title       = title,
+        description = description or nil,
+        giver       = giver,
+        task_id     = task_id
+    }
+    rawset(_G, "talker_current_objective", new_objective)
+    talker_current_objective = new_objective
+    log.info("%s: New current objective set -> %s (from %s)", script_name, tostring(title), tostring(giver))
+end
+
+local function clear_current_objective(reason)
+    rawset(_G, "talker_current_objective", {
+        title = nil,
+        description = nil,
+        giver = nil,
+        task_id = nil
+    })
+    talker_current_objective = rawget(_G, "talker_current_objective")
+    log.info("%s: Cleared current objective (%s)", script_name, reason or "unknown")
+end
+
+local function force_refresh_current_objective()
+    local current = rawget(_G, "talker_current_objective")
+    if not current or not current.task_id then
+        return
+    end
+
+    local task_id = tostring(current.task_id)
+    local live_title = nil
+
+    if task_manager.get_task then
+        local tsk = task_manager.get_task(current.task_id)
+        if tsk then
+            live_title = get_clean_task_title(tsk)
+        end
+    end
+
+    local info = known_transitions[task_id]
+    if info and db and db.actor then
+        local has_item = db.actor:object(info.item) ~= nil
+        if not has_item then
+            has_item = db.actor:object("kuznec_stry_doc") ~= nil
+        end
+        if has_item and current.title ~= info.next_title then
+            live_title = info.next_title
+            log.info("%s: Using known transition for %s -> %s", script_name, task_id, live_title)
+        end
+    end
+
+    if not live_title or live_title == ""
+       or string.find(live_title, "{=", 1, true)
+       or string.find(live_title, "actor_has_item", 1, true)
+       or live_title == current.title then
+        return
+    end
+
+    set_current_objective(live_title, current.giver, current.task_id)
+    log.info("%s: Quest stage updated (forced refresh) -> %s", script_name, live_title)
+end
+
+_G.force_refresh_current_objective = force_refresh_current_objective
+_G.clear_pending_task_accept = clear_pending_task_accept
+
+--------------------------------------------------------------------------------
+-- Accept path
+--------------------------------------------------------------------------------
+
+local function on_task_accepted_event(tsk, cached_info)
+    if not tsk then return end
+
+    log.info("%s: on_task_accepted_event CALLED", script_name)
+
+    local task_title = get_clean_task_title(tsk)
+    local task_id = tsk:get_id()
+    if not task_title or task_title == "" then
+        return
+    end
+
+    local task_info = cached_info
+    if not task_info then
+        local tm = task_manager.get_task_manager and task_manager.get_task_manager()
+        if tm and tm.task_info and tm.task_info[task_id] then
+            task_info = tm.task_info[task_id]
+        end
+    end
+
+    local giver_name = get_quest_giver_name(task_info)
+    if not giver_name or giver_name == "Unknown" then
+        log.info("%s: WARNING - no clear giver for quest -> %s (accepting with Unknown)", script_name, task_title)
+        giver_name = "Unknown"
+    end
+
+    local current = rawget(_G, "talker_current_objective") or {}
+    local should_update = false
+    if not current.title then
+        should_update = true
+    elseif tostring(current.task_id) == tostring(task_id) then
+        if current.title ~= task_title then
+            should_update = true
+            log.info("%s: Quest stage updated -> %s", script_name, task_title)
+        end
+    else
+        should_update = true
+    end
+
+    local task_descr = get_clean_task_description(tsk)
+
+    if should_update then
+        set_current_objective(task_title, giver_name, task_id, task_descr)
+    else
+        -- Same task + same title already stored (duplicate stage callback).
+        -- Skip reaction to avoid double PENDING / double spoken lines.
+        return
+    end
+
+    -- Accept reaction only when objective actually changed (new task or real stage change)
+    if mode_task == 1 then
+        return
+    end
+
+    local player = game_adapter.get_player_character()
+    local player_fmt, player_vals = queries.get_character_event_info(player)
+    local companions = game_adapter.get_companions() or {}
+    local witnesses = game_adapter.get_characters_near_player() or {}
+
+    for _, companion in ipairs(companions) do
+        witnesses[#witnesses + 1] = companion
+    end
+
+    local giver_id = resolve_giver_id(task_info)
+    if giver_id then
+        local giver_char = game_adapter.get_character_by_id(tostring(giver_id))
+        if giver_char then
+            witnesses[#witnesses + 1] = giver_char
+        end
+    end
+
+    local is_silent = get_silence_status(mode_task)
+    if is_silent == nil then
+        return
+    end
+
+    local unique = is_unique_giver(giver_id)
+    if unique then
+        log.info("%s: Unique check OK giver_id=%s", script_name, tostring(giver_id))
+    else
+        is_silent = true
+        log.info("%s: Accept reaction silent (giver is not unique) giver_id=%s", script_name, tostring(giver_id))
+    end
+
+    -- task_descr already resolved above for objective storage
+    local description
+    if task_descr and task_descr ~= "" then
+        description = player_fmt
+            .. " accepted a new task from " .. giver_name
+            .. ": '" .. task_title .. "'. Details: " .. task_descr
+    else
+        description = player_fmt
+            .. " accepted a new task: '" .. task_title .. "' from " .. giver_name .. "."
+    end
+
+    pending_task_accept = {
+        description = description,
+        player_vals = player_vals,
+        witnesses   = witnesses,
+        is_silent   = is_silent,
+        created_ms  = queries.get_game_time_ms(),
+        task_title  = task_title,
+        giver_name  = giver_name
+    }
+
+    log.info("%s: Task accept reaction PENDING (waits for dialog close) -> %s", script_name, task_title)
+    start_pending_accept_watcher()
+end
+
+--------------------------------------------------------------------------------
+-- Complete path: clear objective only (stock Talker still speaks on complete)
+--------------------------------------------------------------------------------
+
+local function on_task_completed_clear_objective(tsk, cached_info)
+    if not tsk then return end
+    local task_id = tsk:get_id()
+    local current = rawget(_G, "talker_current_objective")
+    if current and current.task_id and tostring(current.task_id) == tostring(task_id) then
+        clear_current_objective("task completed")
+    end
+    clear_pending_task_accept("task completed")
+end
+
+--------------------------------------------------------------------------------
+-- Callback chain + startup
+--------------------------------------------------------------------------------
+
+local function cache_task_info(tsk)
+    local cached_info = nil
+    pcall(function()
+        local task_id = tsk:get_id()
+        local tm = task_manager.get_task_manager and task_manager.get_task_manager()
+        if tm and tm.task_info and tm.task_info[task_id] then
+            cached_info = tm.task_info[task_id]
+        end
+    end)
+    return cached_info
+end
+
+function on_game_start()
+    if task_manager and task_manager.task_callback then
+        chained_task_callback = task_manager.task_callback
+        task_manager.task_callback = function(tsk, stage)
+            local cached_info = cache_task_info(tsk)
+
+            -- Always run original (stock completion dialogue, etc.)
+            if chained_task_callback then
+                chained_task_callback(tsk, stage)
+            end
+
+            if stage == task.completed then
+                on_task_completed_clear_objective(tsk, cached_info)
+            else
+                on_task_accepted_event(tsk, cached_info)
+            end
+        end
+        log.info("%s: Chained task_manager.task_callback (objective + accept reaction)", script_name)
+    else
+        log.error("%s: Could not chain task_manager.task_callback", script_name)
+    end
+
+    if RegisterScriptCallback then
+        RegisterScriptCallback("ActorMenu_on_mode_changed", on_actor_menu_mode_changed_safe)
+        log.info("%s: Registered ActorMenu_on_mode_changed for pending task accept", script_name)
+
+        -- Persist objective without patching stock talker_game_persistence.script
+        RegisterScriptCallback("save_state", function(saved_data)
+            if type(saved_data) ~= "table" then
+                return
+            end
+            local obj = rawget(_G, "talker_current_objective")
+            if obj and obj.title then
+                saved_data.talker_ext_current_objective = {
+                    title       = obj.title,
+                    description = obj.description,
+                    giver       = obj.giver or "Unknown",
+                    task_id     = obj.task_id
+                }
+                log.info("%s: Saved current objective -> %s (from %s)",
+                    script_name, tostring(obj.title), tostring(obj.giver))
+            else
+                saved_data.talker_ext_current_objective = nil
+                log.info("%s: No current objective to save", script_name)
+            end
+        end)
+
+        RegisterScriptCallback("load_state", function(saved_data)
+            if type(saved_data) ~= "table" then
+                return
+            end
+            local obj = saved_data.talker_ext_current_objective
+            if obj and obj.title then
+                rawset(_G, "talker_current_objective", {
+                    title       = obj.title,
+                    description = obj.description,
+                    giver       = obj.giver or "Unknown",
+                    task_id     = obj.task_id
+                })
+                talker_current_objective = rawget(_G, "talker_current_objective")
+                log.info("%s: Loaded current objective -> %s (from %s)",
+                    script_name, tostring(obj.title), tostring(obj.giver))
+            else
+                log.info("%s: No current objective found in save data", script_name)
+            end
+        end)
+        log.info("%s: Registered save_state / load_state for objective persistence", script_name)
+
+        -- Clear pending / refresh objective on level change without patching map script
+        RegisterScriptCallback("on_level_changing", function()
+            clear_pending_task_accept("level changing")
+            if force_refresh_current_objective then
+                pcall(force_refresh_current_objective)
+            end
+        end)
+    end
+
+    if game_async and game_async.repeat_until_true then
+        game_async.repeat_until_true(15, function()
+            if pending_task_accept then
+                local age = queries.get_game_time_ms() - (pending_task_accept.created_ms or 0)
+                if age >= PENDING_ACCEPT_TIMEOUT_MS then
+                    clear_pending_task_accept("timeout")
+                end
+            end
+            return false
+        end)
+    end
+end
+
+function is_loaded()
+    return true
+end
